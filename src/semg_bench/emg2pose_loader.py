@@ -34,7 +34,7 @@ def list_recordings(root: Path | str) -> pd.DataFrame:
     """찾은 HDF5 목록을 메타데이터 CSV(split, stage, side 등)와 filename 으로 합친다."""
     root = Path(root)
     found = find_recordings(root)
-    meta = pd.read_csv(root / METADATA_CSV)
+    meta = pd.read_csv(root / METADATA_CSV, dtype={"user": str, "filename": str})
     merged = found.merge(meta, on="filename", how="left", validate="one_to_one")
     missing = merged["split"].isna().sum()
     if missing:

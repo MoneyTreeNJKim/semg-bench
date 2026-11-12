@@ -1,11 +1,10 @@
 """emg2pose 손 자세 회귀 베이스라인: 1 초 창의 채널별 log RMS -> 관절 각도 릿지 회귀.
 
-실행: uv run python -m semg_bench.emg2pose_baseline --data $DATA_ROOT/emg2pose --seed 0
+실행: uv run python -m semg_bench.emg2pose_baseline --data $DATA_ROOT/emg2pose --users all --shards all --seed 0
 결과: results/emg2pose_baseline_joint_mae.csv, _split.csv, _joint_mae.png
 """
 
 import argparse
-import os
 from pathlib import Path
 
 import matplotlib
@@ -15,9 +14,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import RidgeCV
-from sklearn.pipeline import make_pipeline
+from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from semg_bench.data_scope import data_root, parse_id_list
 from semg_bench.emg2pose_loader import list_recordings, load_recording, make_windows
 
 RESULTS_DIR = Path("results")
@@ -44,24 +44,44 @@ def window_features(emg_w: np.ndarray, ang_w: np.ndarray) -> tuple[np.ndarray, n
     return np.log(rms[keep] + EPS), target[keep]
 
 
+def recording_features(path: Path | str, member: str | None, win_s: float) -> tuple[np.ndarray, np.ndarray]:
+    """녹화 하나를 읽어 창 특징과 목표를 만든다. 원신호는 함수가 끝나면 버려진다."""
+    rec = load_recording(path, member)
+    return window_features(*make_windows(rec.emg, rec.angles, rec.fs, win_s))
+
+
 def build_dataset(recs: pd.DataFrame, win_s: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """녹화마다 읽어 창 특징을 만들고(원신호는 바로 버림) 특징, 목표, 녹화 번호를 쌓는다."""
+    """녹화마다 창 특징을 만들어 특징, 목표, 녹화 번호를 쌓는다."""
     feats, targets, rec_ids = [], [], []
     for i, row in enumerate(recs.itertuples()):
-        rec = load_recording(row.path, row.member)
-        x, y = window_features(*make_windows(rec.emg, rec.angles, rec.fs, win_s))
+        x, y = recording_features(row.path, row.member, win_s)
         feats.append(x)
         targets.append(y)
         rec_ids.append(np.full(len(y), i))
     return np.concatenate(feats), np.concatenate(targets), np.concatenate(rec_ids)
 
 
+def fit_ridge(x: np.ndarray, y: np.ndarray) -> Pipeline:
+    """표준화 + RidgeCV(alpha 는 학습 데이터 안에서 LOO 로 고른다)."""
+    return make_pipeline(StandardScaler(), RidgeCV(alphas=ALPHAS)).fit(x, y)
+
+
+def select_recordings(recs: pd.DataFrame, users: list[str] | None, shards: list[str] | None) -> pd.DataFrame:
+    """피험자(user) 목록과 샤드(tar 파일 이름 또는 stem) 목록으로 녹화를 거른다. None 은 전체."""
+    keep = pd.Series(True, index=recs.index)
+    if users is not None:
+        keep &= recs["user"].astype(str).isin(users)
+    if shards is not None:
+        tar = recs["path"].map(lambda p: Path(p).name)
+        keep &= recs["member"].notna() & (tar.isin(shards) | tar.str.removesuffix(".tar").isin(shards))
+    return recs[keep].reset_index(drop=True)
+
+
 def evaluate(
     x: np.ndarray, y: np.ndarray, is_train: np.ndarray, eval_mask: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """train 으로 릿지를 학습해 평가 창의 관절별 MAE 와 train 평균 예측기의 MAE, 선택된 alpha 를 돌려준다."""
-    model = make_pipeline(StandardScaler(), RidgeCV(alphas=ALPHAS))
-    model.fit(x[is_train], y[is_train])
+    model = fit_ridge(x[is_train], y[is_train])
     mae = np.abs(model.predict(x[eval_mask]) - y[eval_mask]).mean(axis=0)
     mean_mae = np.abs(y[is_train].mean(axis=0) - y[eval_mask]).mean(axis=0)
     return mae, mean_mae, float(model[-1].alpha_)
@@ -88,12 +108,18 @@ def save_mae_plot(table: pd.DataFrame, split: str, out: Path) -> None:
     plt.close(fig)
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    default_data = Path(os.environ.get("DATA_ROOT", "./data")) / "emg2pose"
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--data", type=Path, default=default_data, help="emg2pose 루트 (기본: $DATA_ROOT/emg2pose)")
+def add_scope_args(p: argparse.ArgumentParser) -> None:
+    """emg2pose 범위 인자: 피험자(user)·샤드 목록, 창 길이, seed."""
+    p.add_argument("--users", default="all", help="user ID 목록, 쉼표 구분 (기본 all)")
+    p.add_argument("--shards", default="all", help="샤드 tar 이름 목록, 쉼표 구분 (기본 all)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--win-s", type=float, default=1.0)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--data", type=Path, default=data_root() / "emg2pose", help="emg2pose 루트 (기본: $DATA_ROOT/emg2pose)")
+    add_scope_args(p)
     p.add_argument("--out", type=Path, default=RESULTS_DIR)
     return p.parse_args(argv)
 
@@ -111,7 +137,9 @@ def joint_table(results: dict[str, tuple[np.ndarray, np.ndarray, float]]) -> pd.
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    recs = list_recordings(args.data)
+    recs = select_recordings(list_recordings(args.data), parse_id_list(args.users), parse_id_list(args.shards))
+    if recs.empty:
+        raise SystemExit(f"범위(users={args.users}, shards={args.shards})에 맞는 녹화가 없다")
     recs["eval_split"] = assign_split(recs, args.seed)
     x, y, rec_ids = build_dataset(recs, args.win_s)
     win_split = recs["eval_split"].to_numpy()[rec_ids]

@@ -1,11 +1,10 @@
 """HYSER PR 34 개 동작 분류 베이스라인: RMS·WL 특징 + LDA / 로지스틱 회귀.
 
-실행: uv run python -m semg_bench.hyser_baseline --data $DATA_ROOT/hyser --seed 0
+실행: uv run python -m semg_bench.hyser_baseline --data $DATA_ROOT/hyser --subjects 1 --sessions 1 --seed 0
 결과: results/hyser_baseline_*.csv, results/hyser_baseline_confusion_*.png
 """
 
 import argparse
-import os
 from pathlib import Path
 
 import matplotlib
@@ -21,6 +20,12 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from semg_bench.data_scope import (
+    data_root,
+    find_hyser_sessions,
+    parse_id_list,
+    select_hyser_sessions,
+)
 from semg_bench.hyser_loader import load_hyser_session, rms_wl_features
 
 RESULTS_DIR = Path("results")
@@ -97,13 +102,38 @@ def save_confusion(cm: np.ndarray, labels: np.ndarray, name: str, out_dir: Path)
     plt.close(fig)
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    default_data = Path(os.environ.get("DATA_ROOT", "./data")) / "hyser"
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--data", type=Path, default=default_data, help="HYSER 루트 (기본: $DATA_ROOT/hyser)")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--session", default="subject01_session1")
+def run_session(session_dir: Path, task: str, seed: int) -> tuple[pd.DataFrame, dict[str, np.ndarray], np.ndarray]:
+    """세션 하나를 읽어 시도 단위 5 겹 CV 를 돌린다. 반환: 겹별 정확도, 혼동행렬, 라벨 목록."""
+    session = load_hyser_session(session_dir, task=task)
+    y_trial = session.y
+    feats, y_win, trial_ids = window_dataset(session.x, y_trial, session.fs)
+    del session  # 원신호(수백 MB)는 특징 추출 뒤 버린다
+    print(f"{session_dir.name}/{task}: 시도 {len(y_trial)}, 창 {len(y_win)}, 특징 {feats.shape[1]}")
+    acc, cms = run_cv(feats, y_win, trial_ids, y_trial, seed)
+    return acc.assign(session=session_dir.name, task=task, seed=seed), cms, np.unique(y_trial)
+
+
+def add_scope_args(p: argparse.ArgumentParser) -> None:
+    """HYSER 범위 인자: 데이터 루트, 피험자·세션 목록, 과제, seed."""
+    p.add_argument("--data", type=Path, default=data_root() / "hyser", help="HYSER 루트 (기본: $DATA_ROOT/hyser)")
+    p.add_argument("--subjects", default="all", help="피험자 번호 목록, 예: 1-5,8 (기본 all)")
+    p.add_argument("--sessions", default="all", help="세션 번호 목록, 예: 1 또는 1,2 (기본 all)")
     p.add_argument("--task", default="dynamic", choices=["dynamic", "maintenance"])
+    p.add_argument("--seed", type=int, default=0)
+
+
+def scoped_sessions(args: argparse.Namespace) -> pd.DataFrame:
+    """인자로 받은 범위의 HYSER 세션 목록. 하나도 없으면 오류."""
+    found = find_hyser_sessions(args.data)
+    sel = select_hyser_sessions(found, parse_id_list(args.subjects), parse_id_list(args.sessions))
+    if sel.empty:
+        raise SystemExit(f"{args.data} 에서 범위(subjects={args.subjects}, sessions={args.sessions})에 맞는 세션이 없다")
+    return sel
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    add_scope_args(p)
     p.add_argument("--out", type=Path, default=RESULTS_DIR)
     return p.parse_args(argv)
 
@@ -111,22 +141,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     np.random.seed(args.seed)
-    session = load_hyser_session(args.data / args.session, task=args.task)
-    y_trial = session.y
-    feats, y_win, trial_ids = window_dataset(session.x, y_trial, session.fs)
-    del session  # 원신호(수백 MB)는 특징 추출 뒤 버린다
-    print(f"{args.session}/{args.task}: 시도 {len(y_trial)}, 창 {len(y_win)}, 특징 {feats.shape[1]}")
-    acc, cms = run_cv(feats, y_win, trial_ids, y_trial, args.seed)
+    accs, cms, labels = [], {}, None
+    for row in scoped_sessions(args).itertuples():
+        acc, session_cms, labels = run_session(row.path, args.task, args.seed)
+        accs.append(acc)
+        for name, cm in session_cms.items():
+            cms[name] = cms.get(name, 0) + cm
+    acc = pd.concat(accs, ignore_index=True)
     args.out.mkdir(parents=True, exist_ok=True)
-    acc.assign(seed=args.seed, session=args.session, task=args.task).to_csv(
-        args.out / "hyser_baseline_accuracy.csv", index=False
-    )
+    acc.to_csv(args.out / "hyser_baseline_accuracy.csv", index=False)
     summary = acc.groupby("model")[["window_acc", "trial_acc"]].agg(["mean", "std"])
     summary.to_csv(args.out / "hyser_baseline_summary.csv")
     for name, cm in cms.items():
-        save_confusion(cm, np.unique(y_trial), name, args.out)
+        save_confusion(cm, labels, name, args.out)
     print(summary.round(3).to_string())
-    print(f"저장: {args.out}/hyser_baseline_*.csv, *.png")
+    print(f"세션 {acc['session'].nunique()}개, 저장: {args.out}/hyser_baseline_*.csv, *.png")
 
 
 if __name__ == "__main__":
