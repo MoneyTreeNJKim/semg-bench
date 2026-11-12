@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pandas as pd
 import pytest
@@ -35,10 +36,37 @@ def test_window_features_values_and_nan() -> None:
     emg_w = np.full((3, 2000, 2), 2.0, dtype=np.float32)
     ang_w = np.ones((3, 2000, 4), dtype=np.float32)
     ang_w[1, 5, 0] = np.nan
-    x, y = window_features(emg_w, ang_w)
+    x, y = window_features(emg_w, ang_w, min_valid=1.0)
     assert x.shape == (2, 2) and y.shape == (2, 4)
     np.testing.assert_allclose(x, np.log(2.0), rtol=1e-6)
     np.testing.assert_allclose(y, 1.0)
+
+
+def test_window_features_partial_ik_mask() -> None:
+    emg_w = np.ones((3, 100, 2), dtype=np.float32)
+    ang_w = np.ones((3, 100, 4), dtype=np.float32)
+    ang_w[0, :5] = np.nan  # 5% 무효 -> 유지, 유효 샘플만 평균
+    ang_w[0, 5:10] = 3.0
+    ang_w[1, :20] = np.nan  # 20% 무효 -> 버림
+    x, y = window_features(emg_w, ang_w, min_valid=0.9)
+    assert x.shape == (2, 2)
+    np.testing.assert_allclose(y[0], (5 * 3.0 + 90 * 1.0) / 95)
+    np.testing.assert_allclose(y[1], 1.0)
+
+
+def test_loader_masks_ik_failures(tmp_path: Path) -> None:
+    dtype = np.dtype([("time", "<f8"), ("joint_angles", "<f4", (20,)), ("emg", "<f4", (16,))])
+    ts = np.zeros(4, dtype=dtype)
+    ts["time"] = np.arange(4) / 2000.0
+    ts["joint_angles"][0] = 0.5
+    ts["joint_angles"][2, 3] = 0.1  # 일부 관절만 0 인 행은 정상 자세
+    with h5py.File(tmp_path / "r.hdf5", "w") as f:
+        f.create_group("emg2pose").create_dataset("timeseries", data=ts)
+        f["emg2pose"].attrs["sample_rate"] = 2000.0
+    rec = load_recording(tmp_path / "r.hdf5")
+    assert np.isnan(rec.angles).all(axis=1).tolist() == [False, True, False, True]
+    raw = load_recording(tmp_path / "r.hdf5", mask_ik_failures=False)
+    assert np.isfinite(raw.angles).all()
 
 
 def test_assign_split_uses_csv_when_train_present() -> None:

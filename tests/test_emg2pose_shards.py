@@ -65,7 +65,7 @@ def test_detect_index_columns() -> None:
 def test_extract_eval_and_resume(shard_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert run(shard_dir, tmp_path) == 0
     out = tmp_path / "out"
-    feats = sorted((out / "features_win1").rglob("*.csv.gz"))
+    feats = sorted((out / "features_win1_valid0.9").rglob("*.csv.gz"))
     assert len(feats) == 8
     df = pd.read_csv(feats[0])
     assert len(df) == 4 and df.filter(like="rms_").shape[1] == 16 and df.filter(like="joint_").shape[1] == 20
@@ -83,5 +83,13 @@ def test_extract_eval_and_resume(shard_dir: Path, tmp_path: Path, monkeypatch: p
 
 def test_scope_filters_shards(shard_dir: Path, tmp_path: Path) -> None:
     assert run(shard_dir, tmp_path, "--shards", "shard1", "--stage", "extract") == 0
-    users = sorted(p.parent.name for p in (tmp_path / "out" / "features_win1").rglob("*.csv.gz"))
+    users = sorted(p.parent.name for p in (tmp_path / "out" / "features_win1_valid0.9").rglob("*.csv.gz"))
     assert users == ["u0", "u1", "u2", "u3"] and len(users) == 4
+
+
+def test_missing_shard_does_not_stop_run(shard_dir: Path, tmp_path: Path) -> None:
+    index = pd.read_csv(shard_dir / "index.csv")
+    index.loc[index["member_path"] == "ds/rec0.hdf5", "shard_file"] = "missing.tar"
+    index.to_csv(shard_dir / "index.csv", index=False)
+    assert run(shard_dir, tmp_path, "--stage", "extract") == 1  # 실패를 종료 코드로 알린다
+    assert len(list((tmp_path / "out" / "features_win1_valid0.9").rglob("*.csv.gz"))) == 7

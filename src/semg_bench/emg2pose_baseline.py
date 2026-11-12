@@ -23,6 +23,7 @@ from semg_bench.emg2pose_loader import list_recordings, load_recording, make_win
 RESULTS_DIR = Path("results")
 EPS = 1e-8
 ALPHAS = np.logspace(-3, 3, 13)
+MIN_VALID = 0.9  # 창 안에서 관절 각도가 유효(IK 성공)한 샘플 비율의 하한
 
 
 def assign_split(meta: pd.DataFrame, seed: int, val_frac: float = 0.2) -> pd.Series:
@@ -36,25 +37,36 @@ def assign_split(meta: pd.DataFrame, seed: int, val_frac: float = 0.2) -> pd.Ser
     return pd.Series(np.where(meta["stage"].isin(val_stages), "val", "train"), index=meta.index)
 
 
-def window_features(emg_w: np.ndarray, ang_w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """창별 채널 log RMS 특징과 창 평균 관절 각도 목표를 만든다. 각도에 NaN 이 있는 창은 버린다."""
-    rms = np.sqrt(np.mean(np.square(emg_w, dtype=np.float64), axis=1))
-    target = ang_w.mean(axis=1, dtype=np.float64)
-    keep = np.isfinite(target).all(axis=1)
-    return np.log(rms[keep] + EPS), target[keep]
+def window_features(
+    emg_w: np.ndarray, ang_w: np.ndarray, min_valid: float = MIN_VALID
+) -> tuple[np.ndarray, np.ndarray]:
+    """창별 채널 log RMS 특징과 목표(유효 샘플만의 평균 관절 각도)를 만든다.
+
+    관절 각도가 하나라도 NaN 인 샘플은 무효로 보고, 유효 샘플 비율이 min_valid 미만인 창은 버린다.
+    """
+    valid = np.isfinite(ang_w).all(axis=2)  # (창, 창 길이)
+    keep = valid.mean(axis=1) >= min_valid
+    rms = np.sqrt(np.mean(np.square(emg_w[keep], dtype=np.float64), axis=1))
+    masked = np.where(valid[keep][:, :, None], ang_w[keep], 0.0).astype(np.float64)
+    target = masked.sum(axis=1) / valid[keep].sum(axis=1, keepdims=True)
+    return np.log(rms + EPS), target
 
 
-def recording_features(path: Path | str, member: str | None, win_s: float) -> tuple[np.ndarray, np.ndarray]:
-    """녹화 하나를 읽어 창 특징과 목표를 만든다. 원신호는 함수가 끝나면 버려진다."""
+def recording_features(
+    path: Path | str, member: str | None, win_s: float, min_valid: float = MIN_VALID
+) -> tuple[np.ndarray, np.ndarray]:
+    """녹화 하나를 읽어(IK 실패 구간은 NaN) 창 특징과 목표를 만든다. 원신호는 함수가 끝나면 버려진다."""
     rec = load_recording(path, member)
-    return window_features(*make_windows(rec.emg, rec.angles, rec.fs, win_s))
+    return window_features(*make_windows(rec.emg, rec.angles, rec.fs, win_s), min_valid=min_valid)
 
 
-def build_dataset(recs: pd.DataFrame, win_s: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def build_dataset(
+    recs: pd.DataFrame, win_s: float, min_valid: float = MIN_VALID
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """녹화마다 창 특징을 만들어 특징, 목표, 녹화 번호를 쌓는다."""
     feats, targets, rec_ids = [], [], []
     for i, row in enumerate(recs.itertuples()):
-        x, y = recording_features(row.path, row.member, win_s)
+        x, y = recording_features(row.path, row.member, win_s, min_valid)
         feats.append(x)
         targets.append(y)
         rec_ids.append(np.full(len(y), i))
@@ -114,6 +126,7 @@ def add_scope_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--shards", default="all", help="샤드 tar 이름 목록, 쉼표 구분 (기본 all)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--win-s", type=float, default=1.0)
+    p.add_argument("--min-valid", type=float, default=MIN_VALID, help="창 안 IK 유효 샘플 비율 하한")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -141,7 +154,7 @@ def main(argv: list[str] | None = None) -> None:
     if recs.empty:
         raise SystemExit(f"범위(users={args.users}, shards={args.shards})에 맞는 녹화가 없다")
     recs["eval_split"] = assign_split(recs, args.seed)
-    x, y, rec_ids = build_dataset(recs, args.win_s)
+    x, y, rec_ids = build_dataset(recs, args.win_s, args.min_valid)
     win_split = recs["eval_split"].to_numpy()[rec_ids]
     is_train = win_split == "train"
     results = {s: evaluate(x, y, is_train, win_split == s) for s in sorted(set(win_split) - {"train"})}

@@ -4,7 +4,7 @@
 특징 CSV 가 이미 있는 녹화는 건너뛰므로 중단 후 같은 명령으로 이어서 돌릴 수 있다.
 
 진입점: scripts/run_emg2pose_shards.py
-중간 결과: results/emg2pose/features_win<창>/<user>/<filename>.csv.gz
+중간 결과: results/emg2pose/features_win<창>_valid<비율>/<user>/<filename>.csv.gz (설정이 바뀌면 새 디렉터리)
 최종 결과: results/emg2pose/per_user/<user>.csv, results/emg2pose/joint_mae.csv
 """
 
@@ -12,6 +12,7 @@ import argparse
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -74,8 +75,19 @@ def filter_plan(plan: pd.DataFrame, users: list[str] | None, shards: list[str] |
     return plan[keep].reset_index(drop=True)
 
 
-def feature_path(out: Path, win_s: float, user: str, filename: str) -> Path:
-    return out / f"features_win{win_s:g}" / user / f"{filename}.csv.gz"
+class FeatureConfig(NamedTuple):
+    """특징 추출 설정. 캐시 디렉터리 이름에 들어가 설정이 다른 예전 특징이 섞이지 않게 한다."""
+
+    win_s: float
+    min_valid: float
+
+    @property
+    def tag(self) -> str:
+        return f"win{self.win_s:g}_valid{self.min_valid:g}"
+
+
+def feature_path(out: Path, cfg: FeatureConfig, user: str, filename: str) -> Path:
+    return out / f"features_{cfg.tag}" / user / f"{filename}.csv.gz"
 
 
 def features_frame(x: np.ndarray, y: np.ndarray, row: pd.Series) -> pd.DataFrame:
@@ -85,7 +97,7 @@ def features_frame(x: np.ndarray, y: np.ndarray, row: pd.Series) -> pd.DataFrame
     return df.assign(**{c: row[c] for c in META_COLS}, window=np.arange(len(df)))
 
 
-def process_shard(shard_path: Path, rows: pd.DataFrame, out: Path, win_s: float, local_dir: Path) -> list[str]:
+def process_shard(shard_path: Path, rows: pd.DataFrame, out: Path, cfg: FeatureConfig, local_dir: Path) -> list[str]:
     """샤드를 스트림으로 한 번 읽으며 필요한 HDF5 만 하나씩 로컬에 풀어 특징을 저장하고 지운다. 실패 목록 반환."""
     needed = {r["filename"]: r for _, r in rows.iterrows()}
     done, failed = set(), []
@@ -97,9 +109,9 @@ def process_shard(shard_path: Path, rows: pd.DataFrame, out: Path, win_s: float,
             tar.extract(member, local_dir, filter="data")
             local = local_dir / member.name
             try:
-                x, y = recording_features(local, None, win_s)
+                x, y = recording_features(local, None, cfg.win_s, cfg.min_valid)
                 row = needed[name]
-                write_csv_atomic(features_frame(x, y, row), feature_path(out, win_s, row["user"], name))
+                write_csv_atomic(features_frame(x, y, row), feature_path(out, cfg, row["user"], name))
             except (OSError, KeyError, ValueError) as e:
                 print(f"  {name}: 실패 - {e}")
                 failed.append(name)
@@ -111,22 +123,26 @@ def process_shard(shard_path: Path, rows: pd.DataFrame, out: Path, win_s: float,
     return failed + sorted(set(needed) - done)
 
 
-def extract_features(plan: pd.DataFrame, shards_dir: Path, out: Path, win_s: float, local_dir: Path) -> list[str]:
+def extract_features(plan: pd.DataFrame, shards_dir: Path, out: Path, cfg: FeatureConfig, local_dir: Path) -> list[str]:
     """특징 CSV 가 없는 녹화만 골라 샤드별로 처리한다. 실패·누락 녹화 이름을 돌려준다."""
-    exists = plan.apply(lambda r: feature_path(out, win_s, r["user"], r["filename"]).exists(), axis=1)
+    exists = plan.apply(lambda r: feature_path(out, cfg, r["user"], r["filename"]).exists(), axis=1)
     pending = plan[~exists]
     print(f"녹화 {len(plan)}개 중 완료 {int(exists.sum())}, 남음 {len(pending)} (샤드 {pending['shard'].nunique()}개)")
     local_dir.mkdir(parents=True, exist_ok=True)
     failed: list[str] = []
     for i, (shard, rows) in enumerate(pending.groupby("shard", sort=True), 1):
         print(f"[{i}/{pending['shard'].nunique()}] {shard}: 녹화 {len(rows)}개")
-        failed += process_shard(shards_dir / shard, rows, out, win_s, local_dir)
+        try:
+            failed += process_shard(shards_dir / shard, rows, out, cfg, local_dir)
+        except (OSError, tarfile.TarError) as e:  # 샤드가 없거나 손상돼도 나머지 샤드는 계속한다
+            print(f"  {shard}: 샤드 실패 - {e}")
+            failed += rows["filename"].tolist()
     return failed
 
 
-def load_features(plan: pd.DataFrame, out: Path, win_s: float) -> pd.DataFrame:
+def load_features(plan: pd.DataFrame, out: Path, cfg: FeatureConfig) -> pd.DataFrame:
     """범위 안의 녹화 특징 CSV 를 모두 읽어 하나의 표로 합친다."""
-    paths = [p for _, r in plan.iterrows() if (p := feature_path(out, win_s, r["user"], r["filename"])).exists()]
+    paths = [p for _, r in plan.iterrows() if (p := feature_path(out, cfg, r["user"], r["filename"])).exists()]
     if not paths:
         raise SystemExit("특징 CSV 가 없다. 먼저 추출 단계를 돌려라")
     return pd.concat([pd.read_csv(p, dtype={"user": str}) for p in paths], ignore_index=True)
@@ -183,11 +199,12 @@ def main(argv: list[str] | None = None) -> int:
     plan = filter_plan(plan, parse_id_list(args.users), parse_id_list(args.shards))
     if plan.empty:
         raise SystemExit(f"범위(users={args.users}, shards={args.shards})에 맞는 녹화가 없다")
+    cfg = FeatureConfig(args.win_s, args.min_valid)
     failed = []
     if args.stage in ("all", "extract"):
-        failed = extract_features(plan, args.shards_dir, args.out, args.win_s, args.local_dir)
+        failed = extract_features(plan, args.shards_dir, args.out, cfg, args.local_dir)
     if args.stage in ("all", "eval"):
-        table = evaluate_features(load_features(plan, args.out, args.win_s), args.seed, args.out)
+        table = evaluate_features(load_features(plan, args.out, cfg), args.seed, args.out)
         print(table.groupby("split")[["mae_deg", "mean_baseline_mae_deg"]].mean().round(2).to_string())
         print(f"저장: {args.out}/joint_mae.csv, {args.out}/per_user/*.csv")
     if failed:

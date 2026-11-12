@@ -42,8 +42,12 @@ def list_recordings(root: Path | str) -> pd.DataFrame:
     return merged.reset_index(drop=True)
 
 
-def read_recording(f: h5py.File) -> Emg2PoseRecording:
-    """열린 HDF5 에서 emg2pose/timeseries 를 읽는다. emg 와 각도는 같은 행이라 이미 정렬돼 있다."""
+def read_recording(f: h5py.File, mask_ik_failures: bool = True) -> Emg2PoseRecording:
+    """열린 HDF5 에서 emg2pose/timeseries 를 읽는다. emg 와 각도는 같은 행이라 이미 정렬돼 있다.
+
+    mask_ik_failures: 관절 각도가 전부 정확히 0 인 행은 IK(역기구학) 실패 구간이므로 NaN 으로 바꾼다.
+    미니 데이터셋에서 평균 15%, 많게는 47% 의 행이 이렇다.
+    """
     group = f["emg2pose"]
     ts = group["timeseries"][:]
     attrs = dict(group.attrs)
@@ -51,17 +55,19 @@ def read_recording(f: h5py.File) -> Emg2PoseRecording:
     if np.any(np.diff(time) <= 0):
         raise ValueError("timeseries 의 time 이 단조 증가하지 않는다")
     emg = np.ascontiguousarray(ts["emg"], dtype=np.float32)
-    angles = np.ascontiguousarray(ts["joint_angles"], dtype=np.float32)
+    angles = np.array(ts["joint_angles"], dtype=np.float32)
+    if mask_ik_failures:
+        angles[np.all(angles == 0, axis=1)] = np.nan
     return Emg2PoseRecording(emg, angles, time, float(attrs["sample_rate"]), attrs)
 
 
-def load_recording(path: Path | str, member: str | None = None) -> Emg2PoseRecording:
+def load_recording(path: Path | str, member: str | None = None, mask_ik_failures: bool = True) -> Emg2PoseRecording:
     """HDF5 파일 하나를 읽는다. member 가 있으면 path 를 tar 로 보고 풀지 않고 스트림으로 연다."""
     if member is None:
         with h5py.File(path, "r") as f:
-            return read_recording(f)
+            return read_recording(f, mask_ik_failures)
     with tarfile.open(path) as tar, h5py.File(tar.extractfile(member), "r") as f:
-        return read_recording(f)
+        return read_recording(f, mask_ik_failures)
 
 
 def make_windows(
