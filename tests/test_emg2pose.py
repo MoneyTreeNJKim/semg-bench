@@ -6,7 +6,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from semg_bench.emg2pose_baseline import assign_split, evaluate, window_features
+from semg_bench.emg2pose_baseline import (
+    FeatureConfig,
+    assign_split,
+    evaluate,
+    fit_predict,
+    window_features,
+)
 from semg_bench.emg2pose_loader import list_recordings, load_recording, make_windows
 
 DATA_DIR = Path(os.environ.get("DATA_ROOT", "./data")) / "emg2pose"
@@ -36,7 +42,7 @@ def test_window_features_values_and_nan() -> None:
     emg_w = np.full((3, 2000, 2), 2.0, dtype=np.float32)
     ang_w = np.ones((3, 2000, 4), dtype=np.float32)
     ang_w[1, 5, 0] = np.nan
-    x, y = window_features(emg_w, ang_w, min_valid=1.0)
+    x, y = window_features(emg_w, ang_w, min_valid=1.0, features=("rms",))
     assert x.shape == (2, 2) and y.shape == (2, 4)
     np.testing.assert_allclose(x, np.log(2.0), rtol=1e-6)
     np.testing.assert_allclose(y, 1.0)
@@ -48,7 +54,7 @@ def test_window_features_partial_ik_mask() -> None:
     ang_w[0, :5] = np.nan  # 5% 무효 -> 유지, 유효 샘플만 평균
     ang_w[0, 5:10] = 3.0
     ang_w[1, :20] = np.nan  # 20% 무효 -> 버림
-    x, y = window_features(emg_w, ang_w, min_valid=0.9)
+    x, y = window_features(emg_w, ang_w, min_valid=0.9, features=("rms",))
     assert x.shape == (2, 2)
     np.testing.assert_allclose(y[0], (5 * 3.0 + 90 * 1.0) / 95)
     np.testing.assert_allclose(y[1], 1.0)
@@ -67,6 +73,34 @@ def test_loader_masks_ik_failures(tmp_path: Path) -> None:
     assert np.isnan(rec.angles).all(axis=1).tolist() == [False, True, False, True]
     raw = load_recording(tmp_path / "r.hdf5", mask_ik_failures=False)
     assert np.isfinite(raw.angles).all()
+
+
+def test_window_features_rms_and_wl_blocks() -> None:
+    t = np.arange(2000, dtype=np.float64)
+    emg_w = np.stack([np.where(t % 2 == 0, 1.0, -1.0), np.full(2000, 3.0)], axis=1)[None]  # (1, 2000, 2)
+    x, _ = window_features(emg_w, np.zeros((1, 2000, 4)), features=("rms", "wl"))
+    assert x.shape == (1, 4)  # [rms_ch0, rms_ch1, wl_ch0, wl_ch1]
+    np.testing.assert_allclose(x[0, :2], np.log([1.0, 3.0]), atol=1e-6)
+    np.testing.assert_allclose(np.exp(x[0, 2]), 2.0, rtol=1e-6)  # ±1 교대 -> 샘플당 변화 2
+    assert x[0, 3] < -15  # 상수 채널의 WL 은 0 (log EPS)
+
+
+def test_feature_config_tag_changes_with_settings() -> None:
+    assert FeatureConfig().tag == "win1_step0.25_valid0.9_rms+wl"
+    assert FeatureConfig(features=("rms",)).tag != FeatureConfig().tag
+
+
+def test_fit_predict_per_group_uses_group_mean() -> None:
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((200, 3))
+    g = np.repeat(["left", "right"], 100)
+    y = np.where(g[:, None] == "left", 1.0, -1.0) + x @ np.ones((3, 2)) * 0.1
+    _, mean_pred, _ = fit_predict(x, y, x, g, g)
+    np.testing.assert_allclose(mean_pred[g == "left"], np.broadcast_to(y[g == "left"].mean(axis=0), (100, 2)))
+    np.testing.assert_allclose(mean_pred[g == "right"], np.broadcast_to(y[g == "right"].mean(axis=0), (100, 2)))
+    pooled, _, _ = fit_predict(x, y, x)
+    grouped, _, _ = fit_predict(x, y, x, g, g)
+    assert np.abs(grouped - y).mean() < np.abs(pooled - y).mean()
 
 
 def test_assign_split_uses_csv_when_train_present() -> None:

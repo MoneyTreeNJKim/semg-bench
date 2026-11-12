@@ -12,11 +12,22 @@ import numpy as np
 import pandas as pd
 
 from semg_bench.data_scope import write_csv_atomic
-from semg_bench.hyser_baseline import add_scope_args, run_session, scoped_sessions
+from semg_bench.hyser_baseline import (
+    add_scope_args,
+    model_names,
+    run_session,
+    scoped_sessions,
+)
 
 
 def accuracy_path(out: Path, name: str, task: str) -> Path:
     return out / "accuracy" / f"{name}_{task}.csv"
+
+
+def is_done(out: Path, name: str, task: str, models: tuple[str, ...]) -> bool:
+    """정확도 CSV 가 있고 요청한 모델이 모두 들어 있으면 완료로 본다(모델을 늘려 다시 돌리면 재실행)."""
+    path = accuracy_path(out, name, task)
+    return path.exists() and set(models) <= set(pd.read_csv(path, usecols=["model"])["model"])
 
 
 def save_session(out: Path, name: str, acc: pd.DataFrame, cms: dict[str, np.ndarray], labels: np.ndarray) -> None:
@@ -53,14 +64,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     np.random.seed(args.seed)
-    sessions = scoped_sessions(args)
+    sessions, models = scoped_sessions(args), model_names(args)
     failed: list[str] = []
     for i, row in enumerate(sessions.itertuples(), 1):
-        if accuracy_path(args.out, row.name, args.task).exists() and not args.redo:
+        if is_done(args.out, row.name, args.task, models) and not args.redo:
             print(f"[{i}/{len(sessions)}] {row.name}: 완료됨, 건너뜀")
             continue
         try:
-            acc, cms, labels = run_session(row.path, args.task, args.seed)
+            acc, cms, labels = run_session(row.path, args.task, args.seed, models)
         except (OSError, ValueError) as e:  # 손상·누락 파일은 기록하고 다음 세션으로
             print(f"[{i}/{len(sessions)}] {row.name}: 실패 - {e}")
             failed.append(row.name)

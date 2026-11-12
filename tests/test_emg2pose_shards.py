@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from semg_bench import emg2pose_shards
+from semg_bench.emg2pose_baseline import FeatureConfig
 from semg_bench.emg2pose_shards import detect_index_columns, main
 
 FS = 2000.0
@@ -65,10 +66,12 @@ def test_detect_index_columns() -> None:
 def test_extract_eval_and_resume(shard_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert run(shard_dir, tmp_path) == 0
     out = tmp_path / "out"
-    feats = sorted((out / "features_win1_valid0.9").rglob("*.csv.gz"))
+    feats = sorted((out / f"features_{FeatureConfig().tag}").rglob("*.csv.gz"))
     assert len(feats) == 8
     df = pd.read_csv(feats[0])
-    assert len(df) == 4 and df.filter(like="rms_").shape[1] == 16 and df.filter(like="joint_").shape[1] == 20
+    assert len(df) == 13  # 4 초, 1 초 창, 0.25 초 간격
+    assert df.filter(like="rms_").shape[1] == df.filter(like="wl_").shape[1] == 16
+    assert df.filter(like="joint_").shape[1] == 20
     assert not any((tmp_path / "local").rglob("*.hdf5"))  # 풀었던 파일은 지운다
     table = pd.read_csv(out / "joint_mae.csv")
     assert set(table["split"]) == {"val"} and len(table) == 20
@@ -83,7 +86,7 @@ def test_extract_eval_and_resume(shard_dir: Path, tmp_path: Path, monkeypatch: p
 
 def test_scope_filters_shards(shard_dir: Path, tmp_path: Path) -> None:
     assert run(shard_dir, tmp_path, "--shards", "shard1", "--stage", "extract") == 0
-    users = sorted(p.parent.name for p in (tmp_path / "out" / "features_win1_valid0.9").rglob("*.csv.gz"))
+    users = sorted(p.parent.name for p in (tmp_path / "out" / f"features_{FeatureConfig().tag}").rglob("*.csv.gz"))
     assert users == ["u0", "u1", "u2", "u3"] and len(users) == 4
 
 
@@ -92,4 +95,4 @@ def test_missing_shard_does_not_stop_run(shard_dir: Path, tmp_path: Path) -> Non
     index.loc[index["member_path"] == "ds/rec0.hdf5", "shard_file"] = "missing.tar"
     index.to_csv(shard_dir / "index.csv", index=False)
     assert run(shard_dir, tmp_path, "--stage", "extract") == 1  # 실패를 종료 코드로 알린다
-    assert len(list((tmp_path / "out" / "features_win1_valid0.9").rglob("*.csv.gz"))) == 7
+    assert len(list((tmp_path / "out" / f"features_{FeatureConfig().tag}").rglob("*.csv.gz"))) == 7

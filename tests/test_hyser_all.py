@@ -14,17 +14,21 @@ def fake_sessions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
         (tmp_path / "data" / name).mkdir(parents=True)
     calls: list[str] = []
 
-    def fake_run(session_dir: Path, task: str, seed: int) -> tuple[pd.DataFrame, dict[str, np.ndarray], np.ndarray]:
+    def fake_run(
+        session_dir: Path, task: str, seed: int, models: tuple[str, ...] = ("lda",)
+    ) -> tuple[pd.DataFrame, dict[str, np.ndarray], np.ndarray]:
         calls.append(session_dir.name)
-        acc = pd.DataFrame({"model": ["lda", "lda"], "fold": [0, 1], "window_acc": [0.8, 0.9], "trial_acc": [0.9, 1.0]})
-        return acc.assign(session=session_dir.name, task=task, seed=seed), {"lda": np.eye(2, dtype=int)}, np.array([1, 2])
+        acc = pd.concat([pd.DataFrame({"model": [m, m], "fold": [0, 1], "window_acc": [0.8, 0.9], "trial_acc": [0.9, 1.0]})
+                         for m in models], ignore_index=True)
+        cms = {m: np.eye(2, dtype=int) for m in models}
+        return acc.assign(session=session_dir.name, task=task, seed=seed), cms, np.array([1, 2])
 
     monkeypatch.setattr(hyser_all, "run_session", fake_run)
     return calls
 
 
 def test_run_all_resumes(tmp_path: Path, fake_sessions: list[str]) -> None:
-    argv = ["--data", str(tmp_path / "data"), "--out", str(tmp_path / "out"), "--subjects", "2"]
+    argv = ["--data", str(tmp_path / "data"), "--out", str(tmp_path / "out"), "--subjects", "2", "--models", "lda"]
     assert hyser_all.main(argv) == 0
     assert fake_sessions == ["subject02_session1", "subject02_session2"]
     assert (tmp_path / "out" / "accuracy" / "subject02_session1_dynamic.csv").exists()
@@ -40,3 +44,16 @@ def test_run_all_resumes(tmp_path: Path, fake_sessions: list[str]) -> None:
 def test_run_all_no_match(tmp_path: Path, fake_sessions: list[str]) -> None:
     with pytest.raises(SystemExit):
         hyser_all.main(["--data", str(tmp_path / "data"), "--subjects", "7"])
+
+
+def test_run_all_reruns_when_models_added(tmp_path: Path, fake_sessions: list[str]) -> None:
+    base = ["--data", str(tmp_path / "data"), "--out", str(tmp_path / "out"), "--subjects", "1"]
+    assert hyser_all.main(base + ["--models", "lda"]) == 0
+    assert hyser_all.main(base + ["--models", "lda"]) == 0  # 같은 모델: 건너뜀
+    assert hyser_all.main(base + ["--models", "lda,logreg"]) == 0  # 모델 추가: 다시 돈다
+    assert fake_sessions == ["subject01_session1", "subject01_session1"]
+
+
+def test_unknown_model_rejected(tmp_path: Path, fake_sessions: list[str]) -> None:
+    with pytest.raises(SystemExit):
+        hyser_all.main(["--data", str(tmp_path / "data"), "--models", "svm"])

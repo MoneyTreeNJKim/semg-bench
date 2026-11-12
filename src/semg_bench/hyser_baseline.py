@@ -41,12 +41,19 @@ def window_dataset(x: np.ndarray, y: np.ndarray, fs: float) -> tuple[np.ndarray,
     return feats.reshape(-1, n_feats), np.repeat(y, n_windows), trial_ids
 
 
-def make_models(seed: int) -> dict[str, Pipeline]:
-    """비교할 분류기. 특징 수(512)가 클래스당 표본보다 많아 LDA 는 shrinkage 를 쓴다."""
-    return {
-        "lda": make_pipeline(StandardScaler(), LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
-        "logreg": make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000, random_state=seed)),
+MODEL_NAMES = ("lda", "logreg")
+
+
+def make_models(seed: int, names: tuple[str, ...] = MODEL_NAMES) -> dict[str, Pipeline]:
+    """비교할 분류기. 특징 수(512)가 클래스당 표본보다 많아 LDA 는 shrinkage 를 쓴다.
+
+    학습 시간(겹 하나, 태블릿): LDA 0.3 초, 로지스틱 회귀 약 40 초.
+    """
+    models = {
+        "lda": lambda: make_pipeline(StandardScaler(), LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
+        "logreg": lambda: make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000, random_state=seed)),
     }
+    return {name: models[name]() for name in names}
 
 
 def trial_folds(y_trial: np.ndarray, n_splits: int, seed: int) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -63,14 +70,15 @@ def trial_predictions(proba: np.ndarray, classes: np.ndarray, trial_ids: np.ndar
 
 
 def run_cv(
-    feats: np.ndarray, y_win: np.ndarray, trial_ids: np.ndarray, y_trial: np.ndarray, seed: int, n_splits: int = 5
+    feats: np.ndarray, y_win: np.ndarray, trial_ids: np.ndarray, y_trial: np.ndarray, seed: int, n_splits: int = 5,
+    models: tuple[str, ...] = MODEL_NAMES,
 ) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
     """모델별 시도 단위 교차검증. 겹별 정확도 표와 창 단위 혼동행렬(겹 합계)을 돌려준다."""
     labels = np.unique(y_trial)
-    rows, cms = [], {name: np.zeros((len(labels), len(labels)), dtype=np.int64) for name in make_models(seed)}
+    rows, cms = [], {name: np.zeros((len(labels), len(labels)), dtype=np.int64) for name in models}
     for fold, (train_t, test_t) in enumerate(trial_folds(y_trial, n_splits, seed)):
         train, test = np.isin(trial_ids, train_t), np.isin(trial_ids, test_t)
-        for name, model in make_models(seed).items():
+        for name, model in make_models(seed, models).items():
             model.fit(feats[train], y_win[train])
             proba = model.predict_proba(feats[test])
             pred = model.classes_[proba.argmax(axis=1)]
@@ -102,14 +110,16 @@ def save_confusion(cm: np.ndarray, labels: np.ndarray, name: str, out_dir: Path)
     plt.close(fig)
 
 
-def run_session(session_dir: Path, task: str, seed: int) -> tuple[pd.DataFrame, dict[str, np.ndarray], np.ndarray]:
+def run_session(
+    session_dir: Path, task: str, seed: int, models: tuple[str, ...] = MODEL_NAMES
+) -> tuple[pd.DataFrame, dict[str, np.ndarray], np.ndarray]:
     """세션 하나를 읽어 시도 단위 5 겹 CV 를 돌린다. 반환: 겹별 정확도, 혼동행렬, 라벨 목록."""
     session = load_hyser_session(session_dir, task=task)
     y_trial = session.y
     feats, y_win, trial_ids = window_dataset(session.x, y_trial, session.fs)
     del session  # 원신호(수백 MB)는 특징 추출 뒤 버린다
     print(f"{session_dir.name}/{task}: 시도 {len(y_trial)}, 창 {len(y_win)}, 특징 {feats.shape[1]}")
-    acc, cms = run_cv(feats, y_win, trial_ids, y_trial, seed)
+    acc, cms = run_cv(feats, y_win, trial_ids, y_trial, seed, models=models)
     return acc.assign(session=session_dir.name, task=task, seed=seed), cms, np.unique(y_trial)
 
 
@@ -120,6 +130,14 @@ def add_scope_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--sessions", default="all", help="세션 번호 목록, 예: 1 또는 1,2 (기본 all)")
     p.add_argument("--task", default="dynamic", choices=["dynamic", "maintenance"])
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--models", default=",".join(MODEL_NAMES), help="쉼표 구분: lda,logreg (Colab 전체 실행은 lda 만 권장)")
+
+
+def model_names(args: argparse.Namespace) -> tuple[str, ...]:
+    names = tuple(m.strip() for m in args.models.split(",") if m.strip())
+    if not names or set(names) - set(MODEL_NAMES):
+        raise SystemExit(f"--models 는 {MODEL_NAMES} 중에서 고른다: {args.models}")
+    return names
 
 
 def scoped_sessions(args: argparse.Namespace) -> pd.DataFrame:
@@ -143,7 +161,7 @@ def main(argv: list[str] | None = None) -> None:
     np.random.seed(args.seed)
     accs, cms, labels = [], {}, None
     for row in scoped_sessions(args).itertuples():
-        acc, session_cms, labels = run_session(row.path, args.task, args.seed)
+        acc, session_cms, labels = run_session(row.path, args.task, args.seed, model_names(args))
         accs.append(acc)
         for name, cm in session_cms.items():
             cms[name] = cms.get(name, 0) + cm

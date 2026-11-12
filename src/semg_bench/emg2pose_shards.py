@@ -4,7 +4,7 @@
 특징 CSV 가 이미 있는 녹화는 건너뛰므로 중단 후 같은 명령으로 이어서 돌릴 수 있다.
 
 진입점: scripts/run_emg2pose_shards.py
-중간 결과: results/emg2pose/features_win<창>_valid<비율>/<user>/<filename>.csv.gz (설정이 바뀌면 새 디렉터리)
+중간 결과: results/emg2pose/features_<설정 태그>/<user>/<filename>.csv.gz (설정이 바뀌면 새 디렉터리)
 최종 결과: results/emg2pose/per_user/<user>.csv, results/emg2pose/joint_mae.csv
 """
 
@@ -12,16 +12,17 @@ import argparse
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
 
 from semg_bench.data_scope import data_root, parse_id_list, write_csv_atomic
 from semg_bench.emg2pose_baseline import (
+    FeatureConfig,
     add_scope_args,
     assign_split,
-    fit_ridge,
+    feature_config,
+    fit_predict,
     joint_table,
     recording_features,
 )
@@ -75,24 +76,19 @@ def filter_plan(plan: pd.DataFrame, users: list[str] | None, shards: list[str] |
     return plan[keep].reset_index(drop=True)
 
 
-class FeatureConfig(NamedTuple):
-    """특징 추출 설정. 캐시 디렉터리 이름에 들어가 설정이 다른 예전 특징이 섞이지 않게 한다."""
-
-    win_s: float
-    min_valid: float
-
-    @property
-    def tag(self) -> str:
-        return f"win{self.win_s:g}_valid{self.min_valid:g}"
-
-
 def feature_path(out: Path, cfg: FeatureConfig, user: str, filename: str) -> Path:
     return out / f"features_{cfg.tag}" / user / f"{filename}.csv.gz"
 
 
-def features_frame(x: np.ndarray, y: np.ndarray, row: pd.Series) -> pd.DataFrame:
-    """창 특징(rms_XX)과 목표(joint_XX)에 녹화 메타데이터를 붙인 표."""
-    df = pd.DataFrame(np.hstack([x, y]), columns=[f"rms_{i:02d}" for i in range(x.shape[1])]
+def feature_columns(cfg: FeatureConfig, n_features: int) -> list[str]:
+    """특징 열 이름: 특징 종류별 채널 블록(rms_00.., wl_00..)."""
+    n_ch = n_features // len(cfg.features)
+    return [f"{f}_{i:02d}" for f in cfg.features for i in range(n_ch)]
+
+
+def features_frame(x: np.ndarray, y: np.ndarray, row: pd.Series, cfg: FeatureConfig) -> pd.DataFrame:
+    """창 특징과 목표(joint_XX)에 녹화 메타데이터를 붙인 표."""
+    df = pd.DataFrame(np.hstack([x, y]), columns=feature_columns(cfg, x.shape[1])
                       + [f"joint_{j:02d}" for j in range(y.shape[1])])
     return df.assign(**{c: row[c] for c in META_COLS}, window=np.arange(len(df)))
 
@@ -109,9 +105,9 @@ def process_shard(shard_path: Path, rows: pd.DataFrame, out: Path, cfg: FeatureC
             tar.extract(member, local_dir, filter="data")
             local = local_dir / member.name
             try:
-                x, y = recording_features(local, None, cfg.win_s, cfg.min_valid)
+                x, y = recording_features(local, None, cfg)
                 row = needed[name]
-                write_csv_atomic(features_frame(x, y, row), feature_path(out, cfg, row["user"], name))
+                write_csv_atomic(features_frame(x, y, row, cfg), feature_path(out, cfg, row["user"], name))
             except (OSError, KeyError, ValueError) as e:
                 print(f"  {name}: 실패 - {e}")
                 failed.append(name)
@@ -148,25 +144,26 @@ def load_features(plan: pd.DataFrame, out: Path, cfg: FeatureConfig) -> pd.DataF
     return pd.concat([pd.read_csv(p, dtype={"user": str}) for p in paths], ignore_index=True)
 
 
-def evaluate_features(feats: pd.DataFrame, seed: int, out: Path) -> pd.DataFrame:
-    """CSV split(train 이 없으면 stage 분할)으로 릿지를 학습해 전체·피험자별 관절 MAE 를 저장한다."""
+def evaluate_features(feats: pd.DataFrame, seed: int, out: Path, cfg: FeatureConfig, per_side: bool) -> pd.DataFrame:
+    """CSV split(train 이 없으면 stage 분할)으로 (손별) 릿지를 학습해 전체·피험자별 관절 MAE 를 저장한다."""
     recs = feats.drop_duplicates("filename")[["filename", "split", "stage"]].reset_index(drop=True)
     eval_split = feats["filename"].map(dict(zip(recs["filename"], assign_split(recs, seed), strict=True)))
-    xcols, ycols = feats.filter(like="rms_").columns, feats.filter(like="joint_").columns
+    xcols = [c for c in feats.columns if c.split("_")[0] in cfg.features]
+    ycols = [c for c in feats.columns if c.startswith("joint_")]
     x, y = feats[xcols].to_numpy(), feats[ycols].to_numpy()
     train = (eval_split == "train").to_numpy()
-    model = fit_ridge(x[train], y[train])
-    err = pd.DataFrame(np.abs(model.predict(x[~train]) - y[~train]), columns=ycols)
-    base = pd.DataFrame(np.abs(y[train].mean(axis=0) - y[~train]), columns=ycols)
+    side = feats["side"].to_numpy() if per_side else np.zeros(len(feats))
+    pred, mean_pred, alpha = fit_predict(x[train], y[train], x[~train], side[train], side[~train])
+    err = pd.DataFrame(np.abs(pred - y[~train]), columns=ycols)
+    base = pd.DataFrame(np.abs(mean_pred - y[~train]), columns=ycols)
     err["split"] = base["split"] = eval_split[~train].to_numpy()
     err["user"] = base["user"] = feats.loc[~train, "user"].to_numpy()
-    alpha = float(model[-1].alpha_)
     for user, g in err.groupby("user"):
         b = base.loc[g.index]
         res = {s: (gs[ycols].mean().to_numpy(), b.loc[gs.index, ycols].mean().to_numpy(), alpha) for s, gs in g.groupby("split")}
         write_csv_atomic(joint_table(res).assign(user=user), out / "per_user" / f"{user}.csv")
     res = {s: (g[ycols].mean().to_numpy(), base.loc[g.index, ycols].mean().to_numpy(), alpha) for s, g in err.groupby("split")}
-    table = joint_table(res).assign(seed=seed, n_train_windows=int(train.sum()))
+    table = joint_table(res).assign(seed=seed, config=cfg.tag, per_side=per_side, n_train_windows=int(train.sum()))
     write_csv_atomic(table, out / "joint_mae.csv")
     return table
 
@@ -199,12 +196,12 @@ def main(argv: list[str] | None = None) -> int:
     plan = filter_plan(plan, parse_id_list(args.users), parse_id_list(args.shards))
     if plan.empty:
         raise SystemExit(f"범위(users={args.users}, shards={args.shards})에 맞는 녹화가 없다")
-    cfg = FeatureConfig(args.win_s, args.min_valid)
+    cfg = feature_config(args)
     failed = []
     if args.stage in ("all", "extract"):
         failed = extract_features(plan, args.shards_dir, args.out, cfg, args.local_dir)
     if args.stage in ("all", "eval"):
-        table = evaluate_features(load_features(plan, args.out, cfg), args.seed, args.out)
+        table = evaluate_features(load_features(plan, args.out, cfg), args.seed, args.out, cfg, not args.pooled)
         print(table.groupby("split")[["mae_deg", "mean_baseline_mae_deg"]].mean().round(2).to_string())
         print(f"저장: {args.out}/joint_mae.csv, {args.out}/per_user/*.csv")
     if failed:
