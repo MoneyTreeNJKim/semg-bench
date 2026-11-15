@@ -1,6 +1,6 @@
 """HYSER(WFDB) 와 emg2pose(HDF5) 샘플 파일 하나씩을 열어 구조를 표로 정리한다.
 
-실행: DATA_ROOT=./data uv run python -m semg_bench.inspect_data
+실행: DATA_ROOT=./data uv run python -m semg_bench.inspect
 결과: results/inspect.md, results/inspect.csv
 """
 
